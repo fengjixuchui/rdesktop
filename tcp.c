@@ -40,9 +40,6 @@
 #include "ssl.h"
 #include "asn.h"
 
-
-#define CHECK(x) assert((x)>=0)
-
 #ifdef _WIN32
 #define socklen_t int
 #define TCP_CLOSE(_sck) closesocket(_sck)
@@ -57,6 +54,11 @@
 #ifndef INADDR_NONE
 #define INADDR_NONE ((unsigned long) -1)
 #endif
+
+/* Windows' self signed certificates omit the required Digital
+   Signature key usage flag, and only %COMPAT makes GnuTLS ignore
+   that violation. */
+#define GNUTLS_PRIORITY "NORMAL:%COMPAT"
 
 #ifdef IPv6
 static struct addrinfo *g_server_address = NULL;
@@ -328,11 +330,23 @@ cert_verify_callback(gnutls_session_t session)
 	return utils_cert_handle_exception(session, status, hostname_mismatch, g_last_server_name);
 }
 
+static void
+gnutls_fatal(const char *text, int status)
+{
+	logger(Core, Error, "%s: %s", text, gnutls_strerror(status));
+	/* TODO: Lookup if exit(1) is just plain wrong, its used here to breakout of
+		fallback code path for connection, eg. if TLS fails, a retry with plain
+		RDP is made.
+	*/
+	exit(1);
+}
+
 /* Establish a SSL/TLS 1.0 connection */
 RD_BOOL
 tcp_tls_connect(void)
 {
 	int err;
+	const char* priority;
 
 	gnutls_certificate_credentials_t xcred;
 
@@ -340,18 +354,51 @@ tcp_tls_connect(void)
 	if (!g_ssl_initialized)
 	{
 		gnutls_global_init();
-		CHECK(gnutls_init(&g_tls_session, GNUTLS_CLIENT));
+		err = gnutls_init(&g_tls_session, GNUTLS_CLIENT);
+		if (err < 0) {
+			gnutls_fatal("Could not initialize GnuTLS", err);
+		}
 		g_ssl_initialized = True;
 	}
 
-	/* It is recommended to use the default priorities */
-	//CHECK(gnutls_set_default_priority(g_tls_session));
-	// Use compatible priority to overcome key validation error
-	// THIS IS TEMPORARY
-	CHECK(gnutls_priority_set_direct(g_tls_session, "NORMAL:%COMPAT", NULL));
-	CHECK(gnutls_certificate_allocate_credentials(&xcred));
-	CHECK(gnutls_credentials_set(g_tls_session, GNUTLS_CRD_CERTIFICATE, xcred));
-	CHECK(gnutls_certificate_set_x509_system_trust(xcred));
+	/* FIXME: It is recommended to use the default priorities, but
+	          appending things requires GnuTLS 3.6.3 */
+
+	priority = NULL;
+	if (g_tls_version[0] == 0)
+		priority = GNUTLS_PRIORITY;
+	else if (!strcmp(g_tls_version, "1.0"))
+		priority = GNUTLS_PRIORITY ":-VERS-ALL:+VERS-TLS1.0";
+	else if (!strcmp(g_tls_version, "1.1"))
+		priority = GNUTLS_PRIORITY ":-VERS-ALL:+VERS-TLS1.1";
+	else if (!strcmp(g_tls_version, "1.2"))
+		priority = GNUTLS_PRIORITY ":-VERS-ALL:+VERS-TLS1.2";
+
+	if (priority == NULL)
+	{
+		logger(Core, Error,
+		       "tcp_tls_connect(), TLS method should be 1.0, 1.1, or 1.2");
+		goto fail;
+	}
+
+	err = gnutls_priority_set_direct(g_tls_session, priority, NULL);
+	if (err < 0) {
+		gnutls_fatal("Could not set GnuTLS priority setting", err);
+	}
+
+	err = gnutls_certificate_allocate_credentials(&xcred);
+	if (err < 0) {
+		gnutls_fatal("Could not allocate TLS certificate structure", err);
+	}
+	err = gnutls_credentials_set(g_tls_session, GNUTLS_CRD_CERTIFICATE, xcred);
+	if (err < 0) {
+		gnutls_fatal("Could not set TLS certificate structure", err);
+	}
+	err = gnutls_certificate_set_x509_system_trust(xcred);
+	if (err < 0) {
+		logger(Core, Error, "%s(), Could not load system trust database: %s",
+			   __func__, gnutls_strerror(err));
+	}
 	gnutls_certificate_set_verify_function(xcred, cert_verify_callback);
 	gnutls_transport_set_int(g_tls_session, g_sock);
 	gnutls_handshake_set_timeout(g_tls_session, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
@@ -366,13 +413,7 @@ tcp_tls_connect(void)
 
 		if (err == GNUTLS_E_CERTIFICATE_ERROR)
 		{
-			logger(Core, Error, "%s(): Certificate error during TLS handshake", __func__);
-
-			/* TODO: Lookup if exit(1) is just plain wrong, its used here to breakout of
-				fallback code path for connection, eg. if TLS fails, a retry with plain
-				RDP is made.
-			*/
-			exit(1);
+			gnutls_fatal("Certificate error during TLS handshake", err);
 		}
 
 		/* Handshake failed with unknown error, lets log */
